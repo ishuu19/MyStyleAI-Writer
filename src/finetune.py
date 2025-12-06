@@ -154,21 +154,40 @@ class FineTuner:
         train_dataset = train_dataset.map(format_prompts, batched=True, remove_columns=train_dataset.column_names)
         val_dataset = val_dataset.map(format_prompts, batched=True, remove_columns=val_dataset.column_names)
         
-        # Tokenize the formatted text
+        # Tokenize the formatted text (memory-efficient with smaller batches)
         def tokenize_function(examples):
             tokenized = self.tokenizer(
                 examples["text"],
                 truncation=True,
-                max_length=2048,
+                max_length=1024,  # Reduced to save memory
                 padding=False,
             )
             # For causal LM, labels are the same as input_ids
             tokenized["labels"] = tokenized["input_ids"].copy()
             return tokenized
         
-        print("Tokenizing dataset...")
-        train_dataset = train_dataset.map(tokenize_function, batched=True, remove_columns=["text"])
-        val_dataset = val_dataset.map(tokenize_function, batched=True, remove_columns=["text"])
+        print("Tokenizing dataset (memory-efficient, this may take a moment)...")
+        # Tokenize in small batches to avoid OOM
+        train_dataset = train_dataset.map(
+            tokenize_function, 
+            batched=True, 
+            batch_size=8,  # Small batch size to save memory
+            remove_columns=["text"],
+            desc="Tokenizing train dataset"
+        )
+        val_dataset = val_dataset.map(
+            tokenize_function, 
+            batched=True, 
+            batch_size=8,
+            remove_columns=["text"],
+            desc="Tokenizing val dataset"
+        )
+        
+        # Clear memory after tokenization
+        import gc
+        gc.collect()
+        if torch is not None and torch.cuda.is_available():
+            torch.cuda.empty_cache()
         
         # Training arguments
         training_args = TrainingArguments(
@@ -188,6 +207,7 @@ class FineTuner:
             save_steps=save_steps,
             save_total_limit=3,
             remove_unused_columns=False,  # Keep all columns after tokenization
+            dataloader_pin_memory=False,  # Save memory
         )
         
         # Create trainer
