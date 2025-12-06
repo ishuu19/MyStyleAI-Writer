@@ -102,7 +102,9 @@ class FineTuner:
               learning_rate: float = 2e-4,
               warmup_steps: int = 5,
               logging_steps: int = 1,
-              save_steps: int = 500):
+              save_steps: int = 500,
+              max_length: int = 256,
+              gradient_accumulation_steps: Optional[int] = None):
         """
         Train the model.
         
@@ -110,11 +112,13 @@ class FineTuner:
             train_dataset: Training dataset
             val_dataset: Validation dataset
             num_epochs: Number of training epochs
-            batch_size: Training batch size
+            batch_size: Training batch size (use 1 for low memory)
             learning_rate: Learning rate
             warmup_steps: Number of warmup steps
             logging_steps: Logging frequency
             save_steps: Model saving frequency
+            max_length: Maximum sequence length (default 256 for memory efficiency)
+            gradient_accumulation_steps: Gradient accumulation steps (auto-calculated if None)
         """
         if not UNSLOTH_AVAILABLE:
             raise RuntimeError("Unsloth is required for training")
@@ -124,8 +128,14 @@ class FineTuner:
         
         print("Starting training...")
         print(f"Epochs: {num_epochs}, Batch size: {batch_size}, Learning rate: {learning_rate}")
+        print(f"Max sequence length: {max_length} (memory optimized)")
         
         from transformers import TrainingArguments, Trainer, DataCollatorForLanguageModeling
+        
+        # Auto-calculate gradient accumulation to maintain effective batch size of 8
+        if gradient_accumulation_steps is None:
+            gradient_accumulation_steps = max(1, 8 // batch_size)
+        print(f"Gradient accumulation steps: {gradient_accumulation_steps} (effective batch size: {batch_size * gradient_accumulation_steps})")
         
         # Prepare tokenizer
         self.tokenizer.padding_side = "right"
@@ -151,17 +161,21 @@ class FineTuner:
             return {"text": texts}
         
         # Apply formatting (lightweight, just string formatting)
-        train_dataset = train_dataset.map(format_prompts, batched=True, remove_columns=train_dataset.column_names)
-        val_dataset = val_dataset.map(format_prompts, batched=True, remove_columns=val_dataset.column_names)
+        train_dataset = train_dataset.map(format_prompts, batched=True, batch_size=100, remove_columns=train_dataset.column_names)
+        val_dataset = val_dataset.map(format_prompts, batched=True, batch_size=100, remove_columns=val_dataset.column_names)
+        
+        # Clear memory after formatting
+        import gc
+        gc.collect()
         
         # Tokenize on-the-fly during training to save memory
         # Use smaller batch size for tokenization
-        print("Tokenizing dataset (memory-efficient)...")
+        print(f"Tokenizing dataset (memory-efficient, max_length={max_length})...")
         def tokenize_function(examples):
             return self.tokenizer(
                 examples["text"],
                 truncation=True,
-                max_length=512,  # Further reduced to save memory
+                max_length=max_length,  # Reduced to save memory
                 padding=False,
             )
         
@@ -169,17 +183,28 @@ class FineTuner:
         train_dataset = train_dataset.map(
             tokenize_function, 
             batched=True, 
-            batch_size=4,  # Very small batch size for tokenization
+            batch_size=2,  # Very small batch size for tokenization to save memory
             remove_columns=["text"],
             desc="Tokenizing train dataset"
         )
+        
+        # Clear memory after train tokenization
+        gc.collect()
+        if torch is not None and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
         val_dataset = val_dataset.map(
             tokenize_function, 
             batched=True, 
-            batch_size=4,
+            batch_size=2,
             remove_columns=["text"],
             desc="Tokenizing val dataset"
         )
+        
+        # Clear memory after val tokenization
+        gc.collect()
+        if torch is not None and torch.cuda.is_available():
+            torch.cuda.empty_cache()
         
         # Add labels (same as input_ids for causal LM)
         def add_labels(examples):
@@ -190,8 +215,7 @@ class FineTuner:
         train_dataset = train_dataset.map(add_labels, batched=True, batch_size=50)
         val_dataset = val_dataset.map(add_labels, batched=True, batch_size=50)
         
-        # Clear memory
-        import gc
+        # Clear memory before training
         gc.collect()
         if torch is not None and torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -199,7 +223,7 @@ class FineTuner:
         # Training arguments
         training_args = TrainingArguments(
             per_device_train_batch_size=batch_size,
-            gradient_accumulation_steps=4,
+            gradient_accumulation_steps=gradient_accumulation_steps,
             warmup_steps=warmup_steps,
             num_train_epochs=num_epochs,
             learning_rate=learning_rate,
@@ -215,6 +239,7 @@ class FineTuner:
             save_total_limit=3,
             remove_unused_columns=False,
             dataloader_pin_memory=False,  # Save memory
+            dataloader_num_workers=0,  # Disable multiprocessing to save memory
         )
         
         # Data collator for dynamic padding
