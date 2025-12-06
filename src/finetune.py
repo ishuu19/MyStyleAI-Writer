@@ -131,6 +131,42 @@ class FineTuner:
         self.tokenizer.padding_side = "right"
         self.tokenizer.pad_token = self.tokenizer.eos_token
         
+        # Format dataset using Unsloth's formatting function
+        print("Formatting dataset for training...")
+        def format_prompts(examples):
+            """Format prompts for instruction-following."""
+            instructions = examples["instruction"]
+            inputs = examples["input"]
+            outputs = examples["output"]
+            
+            texts = []
+            for instruction, input_text, output in zip(instructions, inputs, outputs):
+                # Create prompt in instruction format
+                if input_text:
+                    text = f"### Instruction:\n{instruction}\n\n### Input:\n{input_text}\n\n### Response:\n{output}"
+                else:
+                    text = f"### Instruction:\n{instruction}\n\n### Response:\n{output}"
+                texts.append(text)
+            
+            return {"text": texts}
+        
+        # Apply formatting
+        train_dataset = train_dataset.map(format_prompts, batched=True, remove_columns=train_dataset.column_names)
+        val_dataset = val_dataset.map(format_prompts, batched=True, remove_columns=val_dataset.column_names)
+        
+        # Tokenize the formatted text
+        def tokenize_function(examples):
+            return self.tokenizer(
+                examples["text"],
+                truncation=True,
+                max_length=2048,
+                padding=False,
+            )
+        
+        print("Tokenizing dataset...")
+        train_dataset = train_dataset.map(tokenize_function, batched=True, remove_columns=["text"])
+        val_dataset = val_dataset.map(tokenize_function, batched=True, remove_columns=["text"])
+        
         # Training arguments
         training_args = TrainingArguments(
             per_device_train_batch_size=batch_size,
@@ -148,6 +184,7 @@ class FineTuner:
             output_dir=str(self.checkpoint_dir),
             save_steps=save_steps,
             save_total_limit=3,
+            remove_unused_columns=False,  # Keep all columns after tokenization
         )
         
         # Create trainer
@@ -156,7 +193,7 @@ class FineTuner:
             train_dataset=train_dataset,
             eval_dataset=val_dataset,
             args=training_args,
-            tokenizer=self.tokenizer,
+            processing_class=self.tokenizer,  # Use processing_class instead of tokenizer
         )
         
         # Train
