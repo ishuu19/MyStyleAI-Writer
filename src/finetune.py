@@ -125,13 +125,13 @@ class FineTuner:
         print("Starting training...")
         print(f"Epochs: {num_epochs}, Batch size: {batch_size}, Learning rate: {learning_rate}")
         
-        from transformers import TrainingArguments, Trainer
+        from transformers import TrainingArguments, Trainer, DataCollatorForLanguageModeling
         
         # Prepare tokenizer
         self.tokenizer.padding_side = "right"
         self.tokenizer.pad_token = self.tokenizer.eos_token
         
-        # Format dataset using Unsloth's formatting function
+        # Format dataset - keep as text, tokenize on-the-fly to save memory
         print("Formatting dataset for training...")
         def format_prompts(examples):
             """Format prompts for instruction-following."""
@@ -150,40 +150,47 @@ class FineTuner:
             
             return {"text": texts}
         
-        # Apply formatting
+        # Apply formatting (lightweight, just string formatting)
         train_dataset = train_dataset.map(format_prompts, batched=True, remove_columns=train_dataset.column_names)
         val_dataset = val_dataset.map(format_prompts, batched=True, remove_columns=val_dataset.column_names)
         
-        # Tokenize the formatted text (memory-efficient with smaller batches)
+        # Tokenize on-the-fly during training to save memory
+        # Use smaller batch size for tokenization
+        print("Tokenizing dataset (memory-efficient)...")
         def tokenize_function(examples):
-            tokenized = self.tokenizer(
+            return self.tokenizer(
                 examples["text"],
                 truncation=True,
-                max_length=1024,  # Reduced to save memory
+                max_length=512,  # Further reduced to save memory
                 padding=False,
             )
-            # For causal LM, labels are the same as input_ids
-            tokenized["labels"] = tokenized["input_ids"].copy()
-            return tokenized
         
-        print("Tokenizing dataset (memory-efficient, this may take a moment)...")
-        # Tokenize in small batches to avoid OOM
+        # Tokenize with smaller batches to avoid OOM
         train_dataset = train_dataset.map(
             tokenize_function, 
             batched=True, 
-            batch_size=8,  # Small batch size to save memory
+            batch_size=4,  # Very small batch size for tokenization
             remove_columns=["text"],
             desc="Tokenizing train dataset"
         )
         val_dataset = val_dataset.map(
             tokenize_function, 
             batched=True, 
-            batch_size=8,
+            batch_size=4,
             remove_columns=["text"],
             desc="Tokenizing val dataset"
         )
         
-        # Clear memory after tokenization
+        # Add labels (same as input_ids for causal LM)
+        def add_labels(examples):
+            examples["labels"] = examples["input_ids"].copy()
+            return examples
+        
+        print("Adding labels...")
+        train_dataset = train_dataset.map(add_labels, batched=True, batch_size=50)
+        val_dataset = val_dataset.map(add_labels, batched=True, batch_size=50)
+        
+        # Clear memory
         import gc
         gc.collect()
         if torch is not None and torch.cuda.is_available():
@@ -206,8 +213,14 @@ class FineTuner:
             output_dir=str(self.checkpoint_dir),
             save_steps=save_steps,
             save_total_limit=3,
-            remove_unused_columns=False,  # Keep all columns after tokenization
+            remove_unused_columns=False,
             dataloader_pin_memory=False,  # Save memory
+        )
+        
+        # Data collator for dynamic padding
+        data_collator = DataCollatorForLanguageModeling(
+            tokenizer=self.tokenizer,
+            mlm=False,  # Causal LM, not masked LM
         )
         
         # Create trainer
@@ -216,6 +229,7 @@ class FineTuner:
             train_dataset=train_dataset,
             eval_dataset=val_dataset,
             args=training_args,
+            data_collator=data_collator,
             processing_class=self.tokenizer,  # Use processing_class instead of tokenizer
         )
         
