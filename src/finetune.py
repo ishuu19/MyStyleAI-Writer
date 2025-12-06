@@ -2,7 +2,7 @@
 
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Any
 
 # Check if Unsloth is available
 UNSLOTH_AVAILABLE = False
@@ -156,12 +156,15 @@ class FineTuner:
         
         # Tokenize the formatted text
         def tokenize_function(examples):
-            return self.tokenizer(
+            tokenized = self.tokenizer(
                 examples["text"],
                 truncation=True,
                 max_length=2048,
                 padding=False,
             )
+            # For causal LM, labels are the same as input_ids
+            tokenized["labels"] = tokenized["input_ids"].copy()
+            return tokenized
         
         print("Tokenizing dataset...")
         train_dataset = train_dataset.map(tokenize_function, batched=True, remove_columns=["text"])
